@@ -2,7 +2,9 @@
 
 A three-way merge for Crestron SIMPL Windows programs (`.smw` files), so that several programmers can work on the same program and combine their changes.
 
-Originally published on Google Code by Ian Epperson.
+Written and maintained by Stephen Genusa.
+
+It grew out of an unfinished Python 2 utility of the same name that Ian Epperson published on Google Code. This version runs on Python 3, and the merge itself has been rewritten: how conflicts are settled, how handles are renumbered, and how subsystems, signals and hardware are merged. See [Credits and license](#credits-and-license).
 
 
 ## Why is it needed? ##
@@ -93,9 +95,13 @@ The tests need `pytest`. Most of them run the program on two real SIMPL Windows 
 Not yet proven in real use. The merges are tested against edits made by the test suite to two real programs. No merged program has yet been opened and compiled in SIMPL Windows. Until that has been done on your own programs, keep the three input files and check the result before relying on it.
 
 
-## License ##
-© Copyright 2026 Stephen Genusa
+## Credits and license ##
 
-Copyright Ian Epperson. Parts based on a file called mymerge.py written by Marcos Chaves. 
+Copyright © 2026 Stephen Genusa.
+
+Earlier work that this program builds on:
+
+- The original `smwmerge.py`, copyright Ian Epperson.
+- `mymerge.py` by Marcos Chaves, which parts of the original were based on.
 
 This software may be used and distributed according to the terms of the GNU General Public License, incorporated herein by reference.
