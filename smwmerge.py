@@ -1,14 +1,17 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import difflib
 import sys
-import tkMessageBox
 import re
 import logging
 
 from optparse import OptionParser
 
 newline = '\r\n'
+
+# SMW files are single-byte text (Windows-1252).  Latin-1 maps every byte to
+# one character, so reading and writing with it round-trips the file exactly.
+file_encoding = 'latin-1'
 
 program_description = """
 Perform a three-way merge on a SIMPL Windows file.
@@ -18,13 +21,23 @@ and their changes will be merged into a final output.
 """
 
 copyright = """
+© Copyright 2026 Stephen Genusa
+
 Copyright Ian Epperson.  Parts based on a file called mymerge.py written by Marcos Chaves.
 
 This software may be used and distributed according to the terms
 of the GNU General Public License, incorporated herein by reference.
 """
 
-version = "0.1"
+version = "0.5"
+
+# The side that wins when both sides change the same thing in different ways.
+# 'A' is your-file, 'B' is their-file.
+primary = 'B'
+sideNames = {'A': 'your', 'B': 'their'}
+
+def secondary():
+	return 'A' if primary == 'B' else 'B'
 
 LOGGING_LEVELS = {'critical': logging.CRITICAL,
                   'error': logging.ERROR,
@@ -60,11 +73,11 @@ class Merge:
 	
 	def __init__(self, a=False, b=False, x=False):
 		self.ran = False
-		if a<>False and b<>False and x<>False:
+		if a!=False and b!=False and x!=False:
 			self.conflict, self.result = self.threeWay(a,b,x)
 			self.ran = True
 			
-		elif a<>False and b<>False:
+		elif a!=False and b!=False:
 			self.conflict = False
 			self.result = self.twoWay(a,b)
 			self.ran = True
@@ -84,14 +97,6 @@ class Merge:
 		
 	def __getitem__(self, item):
 		return self.result.__getitem__(item)
-	
-	def eliminateInlineMarkers( self, list ):
-		'''Remove any inline markers from the given list.
-		   Note that this will modify the given list'''
-		#Step backwards through the list so removed items will not munge up the position
-		for ref in range( len(list)-1, 0, -1 ):
-			if list[ref].startswith( self.marker.inline ):
-				del list[ref]
 	
 	#merge two lists, keeping all elements of each in order
 	def twoWay(self,a,b, a_name='A', b_name='B'):
@@ -120,102 +125,92 @@ class Merge:
 		
 		return m
 
+	def _matches(self, x, other):
+		'''Map the place of each element of x to its place in the other list, for the elements both have'''
+		found = {}
+		matcher = difflib.SequenceMatcher( None, x, other, autojunk=False )
+		for block in matcher.get_matching_blocks():
+			for offset in range(block.size):
+				found[block.a + offset] = block.b + offset
+		return found
+	
 	#perform a three-way merge using _conflictManger for any conflicts
 	def threeWay(self, a, b, x, a_name = 'A', b_name = 'B'):
-		xa = list( self.differ.compare(x, a) )
-		xb = list( self.differ.compare(x, b) )
-		m = []
-		index_a = 0
-		index_b = 0
-		had_conflict = False
-		status_a = ''
-		status_b = ''
-		ca = []
-		cb = []
-		cm = []
-		lastStatus = ('','')
-		
-		self.eliminateInlineMarkers( xa )
-		self.eliminateInlineMarkers( xb )
+		'''The elements of x that both sides still have stay where they are.  An
+		   element of x that either side dropped is dropped.  Between the elements
+		   that stay, whatever each side added is put in.'''
+		in_a = self._matches(x, a)
+		in_b = self._matches(x, b)
+		from_x_a = set( in_a.values() )
+		from_x_b = set( in_b.values() )
 		
 		self.a = a
 		self.b = b
 		self.x = x
-		self.xa = xa
-		self.xb = xb
 		
-		while ( index_a < len(xa) ) and ( index_b < len(xb) ):
-			lastStatus = status_a, status_b
-			status_a = xa[index_a][:2]
-			status_b = xb[index_b][:2]
+		m = []
+		had_conflict = False
+		index_a = 0
+		index_b = 0
+		kept = [ index for index in range(len(x)) if index in in_a and index in in_b ]
+		
+		# one more turn after the last kept element, for what was added at the end
+		for index in kept + [None]:
+			if index is None:
+				end_a, end_b = len(a), len(b)
+			else:
+				end_a, end_b = in_a[index], in_b[index]
 			
-			# no changes or identical adds on both sides
-			if xa[index_a] == xb[index_b]:
-				if status_a == self.marker.same:
-					m.append( xa[index_a][2:] )
-					index_a += 1
-					index_b += 1
-					continue
-				elif status_a == self.marker.add:
-					m.append( self._preprocessAdd(xa[index_a][2:], a_name ) )
-					index_a += 1
-					index_b += 1
-					continue
-
-			# removing matching lines from one or both sides
-			if ( (xa[index_a][2:] == xb[index_b][2:])
-				and ( status_a == self.marker.remove or status_b == self.marker.remove ) ):
-				index_a += 1
-				index_b += 1
-				continue
-
-			# adding lines in A
-			if status_a == self.marker.add and status_b == self.marker.same:
-				m.append( self._preprocessAdd(xa[index_a][2:], a_name ) )
-				index_a += 1
-				continue
-
-			# adding line in B
-			if status_b == self.marker.add and status_a == self.marker.same:
-				m.append( self._preprocessAdd(xb[index_b][2:], b_name ) ) 
-				index_b += 1
-				continue
-			
-			# At this point, the only remaining possiblity is an add from both sides that doesn't match
-			
-			# possible conflict.  Attempt last ditch merge
-			mergedLine = self._lastDitchMerge( xa[index_a][2:], xb[index_b][2:] )
-			if mergedLine:
-				m.append( mergedLine )
-				index_a += 1
-				index_b += 1
-				continue
-			
-			# conflict - build list of conflicting lines and pass to handler
-			ca = []
-			cb = []
-			#build list of conflicting lines from A
-			while (index_a < len(xa)) and not xa[index_a].startswith( self.marker.same ):
-				ca.append( self._preprocessAdd(xa[index_a][2:], a_name) )
-				index_a += 1
-			#build list of conflicting lines from B
-			while (index_b < len(xb)) and not xb[index_b].startswith( self.marker.same ):
-				cb.append( self._preprocessAdd(xb[index_b][2:], b_name) )
-				index_b += 1
-				
-			#pass lists to conflict manager
-			resolved, cm = self._conflictManager(ca, cb, lastStatus)
-			m.extend(cm)
+			added_a = [ a[i] for i in range(index_a, end_a) if not i in from_x_a ]
+			added_b = [ b[i] for i in range(index_b, end_b) if not i in from_x_b ]
+			resolved, added = self._mergeAdded( added_a, added_b, a_name, b_name )
+			m.extend( added )
 			if not resolved:
 				had_conflict = True
-
-		# append remining lines - there will be only either A or B
-		for i in range(len(xa) - index_a):
-			m.append( self._preprocessAdd( xa[index_a + i][2:], a_name ) )
-		for i in range(len(xb) - index_b):
-			m.append( self._preprocessAdd( xb[index_b + i][2:], b_name ) )
+			
+			if index is not None:
+				m.append( x[index] )
+			index_a = end_a + 1
+			index_b = end_b + 1
 
 		return had_conflict, m
+	
+	def _mergeAdded(self, added_a, added_b, a_name, b_name):
+		'''Combine what each side added in the same place.
+		   Returns an indication if any conflict was resolved (bool) and the elements for the result.'''
+		if primary == 'A':
+			first, second = added_a, added_b
+		else:
+			first, second = added_b, added_a
+		
+		# the same element added by both sides
+		m = []
+		same = [ element for element in first if element in second ]
+		for element in same:
+			m.extend( self._identicalAdd( element ) )
+		
+		only_a = [ element for element in added_a if not element in same ]
+		only_b = [ element for element in added_b if not element in same ]
+		
+		if only_a and only_b:
+			# possible conflict.  Attempt last ditch merge
+			if len(only_a) == 1 and len(only_b) == 1:
+				mergedLine = self._lastDitchMerge( only_a[0], only_b[0] )
+				if mergedLine:
+					return True, m + [mergedLine]
+		
+		ca = [ self._preprocessAdd( element, a_name ) for element in only_a ]
+		cb = [ self._preprocessAdd( element, b_name ) for element in only_b ]
+		if ca and cb:
+			# conflict - pass the lists to the handler
+			resolved, cm = self._conflictManager( ca, cb, ('', '') )
+			return resolved, m + cm
+		
+		return True, m + ca + cb
+	
+	#both sides added the same element - return what goes into the result
+	def _identicalAdd(self, element):
+		return [ self._preprocessAdd( element, primary ) ]
 	
 	#perform a last attempt to merge the line before calling the conflict manager (stub)
 	def _lastDitchMerge(self, element_a, element_b):
@@ -239,16 +234,17 @@ class Merge:
 
 class MergeConservative( Merge ):
 	def _conflictManager(self, a, b, lastStatus):
-		'''Only return the other files' changes during conflict'''
+		'''Only return the primary file's changes during conflict'''
+		if primary == 'A':
+			return True, a
 		return True, b
 
 class MergeGreedy( Merge ):
 	def _conflictManager(self, a, b, lastStatus):
-		'''Return the sum of all a and b.'''
-		m = []
-		m.extend(a)
-		m.extend(b)
-		return True, m
+		'''Return the sum of all a and b, the primary file's first.'''
+		if primary == 'A':
+			return True, a + b
+		return True, b + a
 
 
 #used for mulitple inheretance	
@@ -262,18 +258,112 @@ class SMWMerger():
 		result = self.childFinder.sub( r'\1-' + sourceName + '=', result )
 		return result
 		
-	def _lastDitchMerge(self, element_a, element_b):
-		# try a line-by-line merge and verify the result is still a legal SMW object		
-		result = newline.join( self.twoWay( element_a.split(newline), element_b.split(newline) ) )
-		try:
-			smwObject(result)
-			return result
-		except SMWError:
-			return False
+	#Handles are numbered separately in each file, so a new object that reads the
+	#same on both sides is still two objects: each side made its own.
+	#(Signals are known by name, and a copy that ends up unused is not written.)
+	def _identicalAdd(self, element):
+		handle = dict( self._objectLines(element) ).get( smw.key.ref )
+		if handle is not None and not handle in self.baseHandles:
+			return [ self._preprocessAdd( element, primary ), self._preprocessAdd( element, secondary() ) ]
+		return [ self._preprocessAdd( element, primary ) ]
+	
+	def threeWay(self, a, b, x, a_name = 'A', b_name = 'B'):
+		self.keyConflict = False
+		self.baseHandles = self._identities(x)
+		a, b = self._mergeChangedObjects( list(a), list(b), x )
+		had_conflict, m = Merge.threeWay( self, a, b, x, a_name, b_name )
+		return had_conflict or self.keyConflict, m
+	
+	def _objectLines(self, element):
+		'''The key=value lines of an object, as [key, value] pairs'''
+		return [ line.split('=',1) for line in element.split(newline) if '=' in line ]
+	
+	def _identities(self, elements):
+		'''Map each object's handle to its place in the list.
+		   A type with a single object and no handles (the header) is known by its type.'''
+		found = {}
+		for index, element in enumerate(elements):
+			keys = dict( self._objectLines(element) )
+			identity = keys.get( smw.key.ref )
+			if identity is None and len(elements) == 1:
+				identity = keys.get( smw.key.type )
+			if identity is not None:
+				found[identity] = index
+		return found
+	
+	def _mergeChangedObjects(self, a, b, x):
+		'''Where both sides changed the same object in different ways, merge it
+		   key by key and give both sides the result.'''
+		in_a = self._identities(a)
+		in_b = self._identities(b)
+		for identity, index in self._identities(x).items():
+			if not ( identity in in_a and identity in in_b ):
+				continue
+			original, mine, theirs = x[index], a[ in_a[identity] ], b[ in_b[identity] ]
+			if mine == original or theirs == original or mine == theirs:
+				continue
+			merged = self._mergeObject( original, mine, theirs )
+			a[ in_a[identity] ] = merged
+			b[ in_b[identity] ] = merged
+		return a, b
+	
+	def _mergeObject(self, original, mine, theirs):
+		'''Three-way merge of the keys of one object.  A key changed on one side
+		   takes that side's value; changed on both, it takes the primary's.'''
+		x = dict( self._objectLines(original) )
+		a = dict( self._objectLines(mine) )
+		b = dict( self._objectLines(theirs) )
+		sides = {'A': a, 'B': b}
 		
+		# keep the keys in the order of the two sides
+		keys_a = [ pair[0] for pair in self._objectLines(mine) ]
+		keys_b = [ pair[0] for pair in self._objectLines(theirs) ]
+		order = []
+		for item in self.differ.compare( keys_a, keys_b ):
+			if not item.startswith( self.marker.inline ) and not item[2:] in order:
+				order.append( item[2:] )
+		
+		out = ['[']
+		for key in order:
+			if key == smw.key.child:
+				out.extend( self._mergeChildren( mine, theirs ) )
+				continue
+			
+			if a.get(key) == b.get(key):
+				source = primary
+			elif b.get(key) == x.get(key):
+				source = 'A'
+			elif a.get(key) == x.get(key):
+				source = 'B'
+			else:
+				source = primary
+				self.keyConflict = True
+				logging.warning( 'Conflict in %s %s (%s): %s is %r in your file and %r in their file.  Kept %ss.'
+					% ( x.get(smw.key.type, ''), x.get(smw.key.ref, ''), x.get(smw.key.name, x.get(smw.key.comment1, '')),
+						key, a.get(key, ''), b.get(key, ''), sideNames[source] ) )
+			
+			value = sides[source].get(key)
+			if value is None:
+				continue
+			line = key + '=' + value
+			if source != primary:
+				# the rest of the object is marked as the primary's when it is added
+				line = SMWMerger._preprocessAdd( self, line, source )
+			out.append( line )
+		
+		out.append(']')
+		return newline.join(out)
+	
+	def _mergeChildren(self, mine, theirs):
+		'''All the children either side lists.  Children that no longer exist are dropped when the file is written.'''
+		children = {}
+		for side, element in ( ('A', mine), ('B', theirs) ):
+			children[side] = [ pair[1] for pair in self._objectLines(element) if pair[0] == smw.key.child ]
+		first, second = children[primary], children[secondary()]
+		out = [ smw.key.child + '=' + child for child in first ]
+		out.extend( smw.key.child + '-' + secondary() + '=' + child for child in second if not child in first )
+		return out
 
-class SMWMergeConservative( SMWMerger, MergeConservative ):
-	pass
 
 class SMWMergeGreedy( SMWMerger, MergeGreedy ):
 	pass
@@ -284,48 +374,36 @@ class MergeMaxKeys( Merge ):
 		# will always return a completed result
 		result = self.twoWay( element_a.split(newline), element_b.split(newline) )
 		final = []
+		position = {}	#where each key sits in final
 		
-		last = ('', '')
 		for line in result:
-			current = result[line].split('=',1)
-			if current[0] == last[0]:
-				if current[1] > last[1]:
-					final[-1] = current
-				else:
-					pass
+			key, separator, value = line.partition('=')
+			if not separator:
+				final.append( line )
+			elif key not in position:
+				position[key] = len(final)
+				final.append( line )
 			else:
-				final.append( result[line] )
-				
-			last = current
+				kept = final[ position[key] ].partition('=')[2]
+				if self._valueOrder(value) > self._valueOrder(kept):
+					final[ position[key] ] = line
 		
 		return newline.join(final)
+	
+	numberFinder = re.compile( '([0-9]+)' )
+	def _valueOrder(self, value):
+		'''Sort key that compares the numbers inside a value as numbers, so 1000 > 650 and 4.10 > 4.9'''
+		parts = self.numberFinder.split(value)
+		#split() alternates text and digits, starting with text
+		return [ int(part) if index % 2 else part for index, part in enumerate(parts) ]
 		
 	def _conflictManager(self, a, b, lastStatus):
 		#should never ever reach this
 		raise NotImplementedError('MergeMaxKeys somehow fell to the Conflict Manager.')
 		
-class MergeSymbols( SMWMerger, Merge ):
-	def _conflictManager(self, a, b, lastStatus):
-		logging.debug( 'at MergeSymbols._conflictManager\n - len(a)=' + str(len(a)) + ' len(b)=' + str(len(b)) )
-		logging.debug(' - lastStatus='+str(lastStatus) )
-		
-		# if we had not just removed a symbol in each file, add both greedily
-		if ( lastStatus <> (self.marker.remove, self.marker.remove) ):
-			return True, a + b
-
-		logging.debug( 'a list:\n')
-		for ai in a:
-			logging.debug( ai )
-			
-		logging.debug( '\n\nb list:\n' )
-		for bi in b:
-			logging.debug( bi )
-
-			
-		tkMessageBox.showerror("SMW Merge Error", "Unhandled merge conflict in the symbol library.\n\nResulting program will be incomplete.")
-		# TODO! check if there's a folder.  If it is, add comment with one of the folder names and use the other
-		# if not, create conflict folder
-		return True, []
+class MergeSymbols( SMWMergeGreedy ):
+	'''Different symbols added in the same place are all kept'''
+	pass
 		
 
 class Order:
@@ -361,6 +439,9 @@ class Order:
 		
 masterObjOrder = Order()
 
+#each signal in the original file, by name
+baseSignals = {}
+
 
 
 class SMWError(Exception):
@@ -379,6 +460,8 @@ class smw:
 		device   = 'Dv'
 		Cm       = 'Cm'	#Cresnet Config?
 		Db       = 'Db' #Central controller?
+		Et       = 'Et' #Ethernet settings
+		Cs       = 'Cs' #Connection sheet
 		
 	class key:
 		type     = 'ObjTp'
@@ -395,31 +478,37 @@ class smw:
 		SmCrossRef = 'SmH'
 		CmCrossRef = 'CmH'
 		DbCrossRef = 'DbH'
+		DvCrossRef = 'DvH'
+		EtCrossRef = 'EtH'
+		CsCrossRef = 'CsH'
+		address  = 'Ad'
+		flag     = 'DvF'
 	
 	crossref = {
 		#'PrH': current table
 		key.SmCrossRef: type.symbol,
 		key.CmCrossRef: type.Cm,
 		key.DbCrossRef: type.Db,
+		key.DvCrossRef: type.device,
+		key.EtCrossRef: type.Et,
+		key.CsCrossRef: type.Cs,
 		}
 		
 	
 	class symType:
 		folder  = '156'
+	
+	slotFlag = 'Sl'		#value of the flag key on a slot
 		
+	#Objects changed on both sides are merged key by key before these run, so
+	#what is left for them is different objects added in the same place.
 	merge = {
 		''            : MergeConservative,
 		type.symbol   : MergeSymbols,
 		type.signal   : SMWMergeGreedy,
 		type.progInfo : MergeMaxKeys,
-		type.header   : SMWMergeConservative,
-		type.FP       : SMWMergeConservative,
-		type.BK       : SMWMergeConservative,
 		type.openSm   : False,				#do not try and merge any open symbols - not worth the effort
-		type.Cm       : SMWMergeConservative,
-		type.Db       : SMWMergeConservative,
-		type.device   : SMWMergeConservative,
-                'unknown'     : SMWMergeConservative,
+		'unknown'     : SMWMergeGreedy,
 		}
 
 class smwObject:
@@ -474,8 +563,8 @@ class smwObject:
 		
 		self.isParent = False
 		
-		# convert child keys to remove specific order number, except for devices which require specific H references
-		if self.hasKey( smw.key.childCount ) and not ( self.type == smw.type.device ):
+		# convert child keys to remove specific order number
+		if self.hasKey( smw.key.childCount ):
 			self.convertChildRefs()
 	
 	def convertChildRefs(self):
@@ -534,7 +623,7 @@ class smwObject:
 		else:
 			refKey = newKey.key
 			
-		if self._data.has_key(refKey) and str(self._data[refKey]) <> value:
+		if refKey in self._data and str(self._data[refKey]) != value:
 			raise SMWError( "Duplicate conflicting key-value in SMW Object input.  Key=" + str(key) )
 		else:
 			self._data[refKey] = newKey
@@ -559,7 +648,7 @@ class smwObject:
 		return self._data[key].source
 	
 	def hasKey(self, key):
-		return self._data.has_key(key)
+		return key in self._data
 	
 	def delKey(self, key):
 		try:
@@ -623,6 +712,30 @@ class diffObject( smwObject ):
 	def convertChildRefs(self):
 		self.isParent = True
 		self.setKey( smw.key.childCount, len(self.children) )  #count of children
+	
+	def setChildren(self, handles):
+		'''Replace the list of children with the given handles, in the given order'''
+		oldKeys = [ child.key for child in self.children ]
+		if oldKeys:
+			position = self._dataOrder.index( oldKeys[0] )
+		elif self.hasKey( smw.key.childCount ):
+			position = self._dataOrder.index( smw.key.childCount ) + 1
+		else:
+			#not a parent object
+			return
+		
+		for key in oldKeys:
+			del self._data[key]
+			self._dataOrder.remove(key)
+		
+		self.children = []
+		for handle in handles:
+			child = self._key( 'C' + str( len(self.children) + 1 ), handle )
+			self._data[child.key] = child
+			self._dataOrder.insert( position + len(self.children), child.key )
+			self.children.append( child )
+		
+		self.setKey( smw.key.childCount, len(self.children) )
 			
 	def fixSignals(self, signalBackTable):
 		'''Turn all inputs and outputs from signal names to H references'''
@@ -647,6 +760,57 @@ class diffObject( smwObject ):
 						#if this signal is used, make sure it isn't hidden
 						sigObj.hidden = False
 
+def expandHandles(text):
+	'''Turn a handle list like 7.9,12 into ['7', '8', '9', '12']'''
+	handles = []
+	for part in text.split(','):
+		first, dot, last = part.partition('.')
+		handles.extend( str(h) for h in range( int(first), int(last or first) + 1 ) )
+	return handles
+
+def compressHandles(handles):
+	'''Turn ['7', '8', '9', '12'] into the handle list 7.9,12'''
+	runs = []
+	for handle in handles:
+		handle = int(handle)
+		if runs and runs[-1][1] == handle - 1:
+			runs[-1][1] = handle
+		else:
+			runs.append( [handle, handle] )
+	return ','.join( str(a) if a == b else str(a) + '.' + str(b) for a, b in runs )
+
+def expandDeviceRanges(chunk):
+	'''A run of identical empty slots is stored as one object with a list of
+	   handles and one address for each.  Return one object per slot.'''
+	lines = chunk.split(newline)
+	if not smw.key.type + '=' + smw.type.device in lines:
+		return [chunk]
+	
+	position = {}
+	for index, line in enumerate(lines):
+		key = line.split('=',1)[0]
+		if key in ( smw.key.ref, smw.key.address ):
+			position[key] = index
+	if len(position) < 2:
+		return [chunk]
+	
+	handleLine, addressLine = position[smw.key.ref], position[smw.key.address]
+	handles = lines[handleLine].split('=',1)[1]
+	addresses = lines[addressLine].split('=',1)[1].split(',')
+	if handles.isdigit():
+		return [chunk]
+	handles = expandHandles(handles)
+	if len(handles) != len(addresses):
+		return [chunk]
+	
+	chunks = []
+	for handle, address in zip(handles, addresses):
+		lines[handleLine] = smw.key.ref + '=' + handle
+		lines[addressLine] = smw.key.address + '=' + address
+		chunks.append( newline.join(lines) )
+	return chunks
+
+
 class inFile:
 	'''Splits a data stream containing SMW objects and makes them ready for diff'ing'''
 	obj = smwObject
@@ -667,10 +831,12 @@ class inFile:
 		self.readData(data)
 
 	def readData(self, data):
-		if type(data) == type(''):
+		if isinstance(data, str):
 			chunks = data.split(newline+']'+newline)
 		else:
 			chunks = data
+		
+		chunks = [ single for chunk in chunks for single in expandDeviceRanges(chunk) ]
 			
 		for chunk in chunks:
 			if not chunk:
@@ -702,7 +868,7 @@ class inFile:
 		#if we have a ref (H), store ref in the lists (as dict)
 		if newObj.H:
 			#if there is no array for this object type, create one
-			if not self.references.has_key(newObj.type):
+			if not newObj.type in self.references:
 				self.references[newObj.type] = {}
 			#store our reference filed by ref (H)
 			self.references[newObj.type][newObj.H] = newObj
@@ -766,7 +932,13 @@ class outFile( inFile ):
 	obj = diffObject
 	refCount = {}
 	
-	def buildRefTables( self, type, base={} ):
+	#The control system device (Dv H=2) has PrH=1, a root that has no object of its own
+	implicitRoot = { smw.type.device: '1' }
+	
+	def buildRefTables( self, type, base=None ):
+		#each type needs its own table - handles are only unique within a type
+		if base is None:
+			base = {}
 		self.references[type] = {}
 		self.references[type][''] = base
 		#build the A and B redirected dict.  Any failed lookups in A or B will try the base
@@ -780,7 +952,7 @@ class outFile( inFile ):
 		#if the object has an H value, fix it and save a reference
 		if newObj.H or newObj.HA or newObj.HB:
 			#if there is no array for this object type, create one
-			if not self.references.has_key(newObj.type):
+			if not newObj.type in self.references:
 				self.buildRefTables( newObj.type )
 			
 			#assume all signals are hidden until referenced otherwise
@@ -809,7 +981,7 @@ class outFile( inFile ):
 # 				
 # 		self.objList[ smw.type.symbol ] = topSymbols + otherSymbols
 	
-	def correctObjectCrossRef( self, obj, list, key ):
+	def correctObjectCrossRef( self, obj, list, key, warn=True ):
 		'''Corrects a given cross ref.
 		   obj is the object to modify
 		   list is the list where we look up the value
@@ -828,11 +1000,19 @@ class outFile( inFile ):
 		global r, o
 		o = obj
 		r = self.references
-		try:
-			refObj = self.references[ list ][ file ][ fileRef ]
-		except KeyError:
-			#raise KeyError('Could not find key in references.  list='+list+' file='+file+' fileRef='+str(fileRef) )
-			logging.warn('Could not find key in references.  obj='+obj.type+' '+obj.H+' -> '+list+' ('+file+') '+str(fileRef) )
+		#An object changed on one side is filed under that side only, so when
+		#the reference's own file does not have it, look in the others.
+		refObj = None
+		for table in [file] + [ f for f in ('', primary, secondary()) if f != file ]:
+			try:
+				refObj = self.references[ list ][ table ][ fileRef ]
+				break
+			except KeyError:
+				continue
+		if refObj is None:
+			if not warn or fileRef == self.implicitRoot.get(list):
+				return
+			logging.warning('Could not find key in references.  obj='+obj.type+' '+obj.H+' -> '+list+' ('+file+') '+str(fileRef) )
 			return
 			
 		#set our ref to that object's H value
@@ -865,11 +1045,40 @@ class outFile( inFile ):
 				while True:
 					try:
 						#look up children in the current list
-						self.correctObjectCrossRef( obj, list, 'C'+str(child) )
+						#a child that has gone is dropped by rebuildChildLists, so no warning for those
+						self.correctObjectCrossRef( obj, list, 'C'+str(child), warn=not obj.children )
 						child += 1
 					except SMWError:
 						break
 				#obj.setKey( smw.key.childCount, child ) - probably not needed
+	
+	def rebuildChildLists( self, list ):
+		'''Make each parent list exactly the objects that name it as their parent.
+		   Both sides may have added children to one parent, or one side may have
+		   removed a child that the other side still lists.  The existing order is
+		   kept and children missing from the list are added at the end.
+		   Depends on corrected cross references.'''
+		if not list in self.objList:
+			return
+		
+		childrenOf = {}
+		for obj in self.objList[list]:
+			parent = obj.getKey( smw.key.parent )
+			if parent:
+				childrenOf.setdefault( parent, [] ).append( obj.H )
+		
+		for obj in self.objList[list]:
+			actual = childrenOf.get( obj.H, [] )
+			ordered = []
+			for child in obj.children:
+				if child.value in actual and not child.value in ordered:
+					ordered.append( child.value )
+			for child in actual:
+				if not child in ordered:
+					ordered.append( child )
+			
+			if ordered != [ child.value for child in obj.children ]:
+				obj.setChildren( ordered )
 	
 	def getUniqueRef( self, ref, obj ):
 		'''Determine and set a unique H ref for a given object '''
@@ -886,17 +1095,17 @@ class outFile( inFile ):
 			pass
 		
 		H = ''
-		# try and register this object with the original ref, then the B ref, then A
-		for Href in [ '', 'B', 'A' ]:
+		# try and register this object with the original ref, then the primary's, then the other
+		for Href in [ '', primary, secondary() ]:
 			H = obj.refs[Href]
-			if not refList.has_key( H ):
+			if not H in refList:
 				refList[ H ] = obj
 				return H
 		
-		H = obj.H or obj.HB or obj.HA
+		H = obj.H or obj.refs[primary] or obj.refs[secondary()]
 		# if we have failed to find a spot (likely due to a conflict), increment until we find one
 		# (could instead look at the highest match, but that may not fill in holes properly)
-		while refList.has_key( H ):
+		while H in refList:
 			# H may be str or float
 			try:
 				H = str( int( H ) +1 )
@@ -908,13 +1117,92 @@ class outFile( inFile ):
 		
 		
 	
+	def origin( self, obj ):
+		'''Where an object came from: '' when it is unchanged, otherwise the side that added or changed it'''
+		if obj.refs['']:
+			return ''
+		if obj.refs[primary]:
+			return primary
+		return secondary()
+	
+	def resolveSlotConflicts( self ):
+		'''A slot holds one device.  When each side put a device in the same slot,
+		   keep the primary's and remove the other with everything that belongs to it.
+		   Depends on corrected cross references.'''
+		devices = self.objList.get( smw.type.device, [] )
+		holders = {}
+		for obj in devices:
+			holders.setdefault( obj.getKey( smw.key.parent ), [] ).append( obj )
+		
+		for slot in list(devices):
+			if slot.getKey( smw.key.flag ) != smw.slotFlag:
+				continue
+			inSlot = holders.get( slot.H, [] )
+			if len(inSlot) < 2:
+				continue
+			keep = ( [ obj for obj in inSlot if self.origin(obj) == primary ] or inSlot )[0]
+			for obj in inSlot:
+				if obj is keep:
+					continue
+				names = { self.origin(keep): keep.name, self.origin(obj): obj.name }
+				logging.warning( 'Conflict in %s %s (%s): the slot holds %r in your file and %r in their file.  Kept %ss.'
+					% ( slot.type, slot.H, slot.name, names.get('A', ''), names.get('B', ''), sideNames[self.origin(keep)] ) )
+				self.removeDevice( obj )
+	
+	def removeDevice( self, device ):
+		'''Remove a device, the devices below it and every object that belongs to them'''
+		removed = self.removeTree( smw.type.device, [device] )
+		handles = [ obj.H for obj in removed ]
+		for list in self.objList:
+			if list == smw.type.device:
+				continue
+			owned = [ obj for obj in self.objList[list] if obj.getKey( smw.key.DvCrossRef ) in handles ]
+			self.removeTree( list, owned )
+	
+	def removeTree( self, list, objects ):
+		'''Remove the given objects of one type along with all their descendants.  Returns what was removed.'''
+		removed = []
+		pending = [ obj for obj in objects ]
+		while pending:
+			obj = pending.pop()
+			removed.append( obj )
+			pending.extend( other for other in self.objList[list]
+				if other.getKey( smw.key.parent ) == obj.H and not other in removed and not other in pending )
+		self.objList[list] = [ obj for obj in self.objList[list] if not obj in removed ]
+		return removed
+	
+	def compressedDevices( self ):
+		'''The device objects for writing, with each run of identical empty slots back in one object'''
+		out = []
+		runs = {}
+		for obj in self.objList[ smw.type.device ]:
+			if obj.getKey( smw.key.flag ) == smw.slotFlag and not obj.hasKey( smw.key.childCount ):
+				lines = str(obj).split(newline)
+				alike = newline.join( line for line in lines
+					if not line.split('=',1)[0] in ( smw.key.ref, smw.key.address ) )
+				if alike in runs:
+					runs[alike].append( obj )
+					continue
+				runs[alike] = [obj]
+			out.append( obj )
+		
+		for run in runs.values():
+			if len(run) > 1:
+				addresses = ','.join( obj.getKey( smw.key.address ) for obj in run )
+				run[0].setKey( smw.key.ref, compressHandles( [ obj.H for obj in run ] ) )
+				run[0].setKey( smw.key.address, addresses )
+		return out
+	
 	def buildForwardReference( self, ref ):
 		'''Build a forward reference table, creating or updating the H values as needed'''
 # 		H = 1
 # 		if ref == smw.type.signal:
 # 			H = self.firstSignal
 			
-		for obj in self.objList[ref]:
+		#unchanged objects keep their handles, then the primary's objects get theirs,
+		#and the other side's objects take what is left
+		byOrigin = sorted( self.objList[ref], key=lambda obj: ['', primary, secondary()].index( self.origin(obj) ) )
+		for obj in byOrigin:
 			#get a unique ref for this obj
 			newH = self.getUniqueRef( ref, obj )
 			
@@ -929,8 +1217,10 @@ class outFile( inFile ):
 			
 			
 		
-	def buildBackReference( self, forward, back={} ):
+	def buildBackReference( self, forward, back=None ):
 		'''Build a back reference table for needed entries'''
+		if back is None:
+			back = {}
 		#assumes each item has a unique name and references table is a list
 		
 		#back = {}
@@ -1002,12 +1292,17 @@ class outFile( inFile ):
 	#override the objectsImported (end of __init__)
 	def objectsImported(self):
 		'''Perform the actions needed to turn these objects back into a happy SMW file'''
-#		if self.objList.has_key( smw.type.symbol ):
+#		if smw.type.symbol in self.objList:
 #			self.recreateParentage()
 #			self.correctSymbolArrangement()
 		
 		for smwType in self.references:
 			self.buildForwardReference( smwType )
+		
+		self.correctAllCrossRefs()
+		self.resolveSlotConflicts()
+		self.rebuildChildLists( smw.type.symbol )
+		self.rebuildChildLists( smw.type.device )
 		
 		global signalBackTable
 		signalBackTable = self.buildBackReference( self.references[smw.type.signal][''] )
@@ -1016,13 +1311,28 @@ class outFile( inFile ):
 		# Re-encode the signal references in the symbol objects
 		#signalBackTable = self.references[ 'back-' + smw.type.signal ]
 		
-		if self.objList.has_key( smw.type.symbol ):
+		#One side may have renamed a signal that the other side still uses under
+		#its old name.  The old name then means the signal that now has its handle.
+		#Or one side may have dropped a signal that the other side has a new use
+		#for.  It is put back, and is only written if something does use it.
+		for name, signal in baseSignals.items():
+			if name in signalBackTable:
+				continue
+			for side in ( primary, secondary() ):
+				renamed = self.references[smw.type.signal][side].get( signal.H )
+				if renamed:
+					signalBackTable[name] = renamed
+					break
+			else:
+				restored = self.obj( str(signal) )
+				restored.hidden = True
+				self.objList[smw.type.signal].append( restored )
+				restored.setRef( self.getUniqueRef( smw.type.signal, restored ) )
+				signalBackTable[name] = restored
+		
+		if smw.type.symbol in self.objList:
 			for obj in self.objList[ smw.type.symbol ]:
 				obj.fixSignals(signalBackTable)
-				
-#			self.rebuildFolderReferences()
-		
-		self.correctAllCrossRefs()
 
 	
 	
@@ -1030,7 +1340,10 @@ class outFile( inFile ):
 		out = []
 		#step through all objects and add
 		for objType in self.objOrder:
-			for obj in self.objList[objType]:
+			objects = self.objList[objType]
+			if objType == smw.type.device:
+				objects = self.compressedDevices()
+			for obj in objects:
 				if not obj.hidden:
 					serialized = str(obj)
 					if(serialized):
@@ -1046,14 +1359,12 @@ class outFile( inFile ):
 ########################################################
 def read_file(filename):
     try:
-        f = open(filename, 'rb')
-        l = f.readlines()
-        f.close()
-    except IOError, err:
-        print "can't open file '" + filename + "'. aborting."
+        # newline='' keeps the CRLF line ends exactly as they are in the file
+        with open(filename, 'r', encoding=file_encoding, newline='') as f:
+            return f.readlines()
+    except IOError:
+        print("can't open file '" + filename + "'. aborting.")
         sys.exit(-1)
-    else:
-        return l
 
 		
 def merge():
@@ -1064,36 +1375,40 @@ def merge():
 	oresult = {}
 	conflict = False
 	objResult = []
-        mergeHandler = smw.merge['unknown']
+	mergeHandler = smw.merge['unknown']
 	
 	for objType in masterObjOrder:
 		try:
-                        mergeHandler = smw.merge[objType]
-                except:
-                        mergeHandler = smw.merge['unknown']
-                        logging.info( 'Unhandled merge object: '+objType+'.  Using Conservative SMW merge.')
+			mergeHandler = smw.merge[objType]
+		except KeyError:
+			mergeHandler = smw.merge['unknown']
+			logging.info( 'Unhandled merge object: '+objType+'.  Using Conservative SMW merge.')
 
 		if mergeHandler:
-                        objResult = mergeHandler( ai.diffOut(objType), bi.diffOut(objType), xi.diffOut(objType) )
-                	oresult[objType] = objResult
-                        logging.info( objType + ' - conflict: ' + str(conflict) ) 
-                	if objResult.conflict:
-                        	conflict = True
+			objResult = mergeHandler( ai.diffOut(objType), bi.diffOut(objType), xi.diffOut(objType) )
+			oresult[objType] = objResult
+			logging.info( objType + ' - conflict: ' + str(objResult.conflict) ) 
+			if objResult.conflict:
+				conflict = True
 		
-                        result.extend(objResult)
+			result.extend(objResult)
 		
 	logging.info('conflict = ' + str(conflict))
+	
+	for signal in xi.references[ smw.type.signal ].values():
+		baseSignals[ signal.name ] = signal
 	
 	global o
 	o = outFile(result)
 	
 	if options.output_file:
-		f = open(sys.argv[4], 'wb')
+		f = open(options.output_file, 'w', encoding=file_encoding, newline='')
 		f.write(str(o))
 		f.write(newline)
 		f.close()
 	else:
-		print str(o)
+		# write through the byte stream so the CRLF line ends are not translated
+		sys.stdout.buffer.write( (str(o) + newline).encode(file_encoding) )
 
 def main():	
 	parser = OptionParser(usage="usage: %prog [options] your-file their-file original-file",
@@ -1102,24 +1417,28 @@ def main():
 							epilog=copyright)
 	parser.add_option("-o", "--output-file", dest="output_file",
 						help="write result to FILE instead of stdout", metavar="FILE")
-	parser.add_option('-l', '--logging-level', dest="log_level", metavar="LEVEL", choices=LOGGING_LEVELS.keys(),
+	parser.add_option('-l', '--logging-level', dest="log_level", metavar="LEVEL", choices=list(LOGGING_LEVELS.keys()),
 						help='Logging level.  '  'LEVEL can be "' + '", "'.join(LOGGING_LEVELS.keys()) + '"')
 	parser.add_option("-f", "--log-file", dest="log_file",
 						help="write debugging information to FILE", metavar="FILE")
 	
-	global options
-	(options, args) = parser.parse_args()
+	parser.add_option("-p", "--primary", dest="primary", metavar="SIDE", choices=['mine', 'theirs'], default='theirs',
+						help='the file that wins when both change the same thing differently: "mine" or "theirs" (default)')
 	
-	logging_level = LOGGING_LEVELS.get(options.log_level, logging.NOTSET)
+	global options, primary
+	(options, args) = parser.parse_args()
+	primary = {'mine': 'A', 'theirs': 'B'}[options.primary]
+	
+	logging_level = LOGGING_LEVELS.get(options.log_level, logging.WARNING)
 	logging.basicConfig(level=logging_level, filename=options.log_file,
 						  format='%(asctime)s %(levelname)s: %(message)s',
 						  datefmt='%Y-%m-%d %H:%M:%S')
 	
 	if len(args) > 2:
 		global af, bf, xf
-		af = "".join(read_file(sys.argv[1]))
-		bf = "".join(read_file(sys.argv[2]))
-		xf = "".join(read_file(sys.argv[3]))
+		af = "".join(read_file(args[0]))
+		bf = "".join(read_file(args[1]))
+		xf = "".join(read_file(args[2]))
 		global ai, bi, xi
 		ai = inFile(af)
 		bi = inFile(bf)
