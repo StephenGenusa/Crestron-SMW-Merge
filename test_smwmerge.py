@@ -631,3 +631,36 @@ def test_signal_dropped_on_one_side_and_given_a_new_use_on_the_other(tmp_path):
 	remove_unused_signals(expected)
 	assert sorted(map(str, Program(text).blocks)) == sorted(map(str, expected.blocks))
 	assert log == ''
+
+
+########################################################
+##   Malformed input
+########################################################
+
+def device_with_handles(handles, addresses='01,02'):
+	return CRLF.join(['[', 'ObjTp=Dv', 'Nm=Not_Used', 'H=' + handles, 'PrH=4', 'DvF=Sl', 'Ad=' + addresses])
+
+
+@standalone
+def test_handle_range_that_does_not_match_its_addresses_is_not_expanded():
+	import tracemalloc
+	import smwmerge
+	# two addresses, but a range that claims two million slots
+	chunk = device_with_handles('1.2000000')
+
+	tracemalloc.start()
+	result = smwmerge.expandDeviceRanges(chunk)
+	peak = tracemalloc.get_traced_memory()[1]
+	tracemalloc.stop()
+
+	assert result == [chunk]
+	assert peak < 1000000
+
+
+@standalone
+@pytest.mark.parametrize('handles', ['9.7', '7.x', '7..9', 'abc,def'])
+def test_handle_range_that_makes_no_sense_is_left_alone(handles):
+	import smwmerge
+	chunk = device_with_handles(handles)
+
+	assert smwmerge.expandDeviceRanges(chunk) == [chunk]

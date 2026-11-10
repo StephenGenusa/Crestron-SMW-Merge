@@ -768,6 +768,18 @@ def expandHandles(text):
 		handles.extend( str(h) for h in range( int(first), int(last or first) + 1 ) )
 	return handles
 
+def countHandles(text):
+	'''How many handles a handle list like 7.9,12 holds, without building it.
+	   Raises ValueError when the list makes no sense.'''
+	count = 0
+	for part in text.split(','):
+		first, dot, last = part.partition('.')
+		size = int(last or first) - int(first) + 1
+		if size < 1:
+			raise ValueError( 'Handle range runs backwards: ' + part )
+		count += size
+	return count
+
 def compressHandles(handles):
 	'''Turn ['7', '8', '9', '12'] into the handle list 7.9,12'''
 	runs = []
@@ -799,9 +811,13 @@ def expandDeviceRanges(chunk):
 	addresses = lines[addressLine].split('=',1)[1].split(',')
 	if handles.isdigit():
 		return [chunk]
-	handles = expandHandles(handles)
-	if len(handles) != len(addresses):
+	#check the size before building the list - a bad range could claim millions of slots
+	try:
+		if countHandles(handles) != len(addresses):
+			return [chunk]
+	except ValueError:
 		return [chunk]
+	handles = expandHandles(handles)
 	
 	chunks = []
 	for handle, address in zip(handles, addresses):
