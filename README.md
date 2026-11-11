@@ -37,6 +37,7 @@ The merged program is written to standard output, or to a file with `-o`:
 |---|---|
 | `-o FILE`, `--output-file=FILE` | Write the result to FILE instead of standard output. |
 | `-p SIDE`, `--primary=SIDE` | The file that wins a conflict: `mine` or `theirs`. The default is `theirs`. |
+| `--no-conflict-folder` | Do not keep the version of a symbol that lost a conflict. See [The conflict folder](#the-conflict-folder). |
 | `-l LEVEL`, `--logging-level=LEVEL` | How much to report: `critical`, `error`, `warning` (the default), `info` or `debug`. |
 | `-f FILE`, `--log-file=FILE` | Write the report to FILE instead of standard error. |
 | `-h`, `--help` | Show the options. |
@@ -63,21 +64,50 @@ One file is the primary. By default it is `their-file`; choose yours with `--pri
 The primary wins only where the two sides cannot both be kept:
 
 - **The same key of the same object was changed to different values.** For example, both of you changed the same parameter of the same symbol. The primary's value is kept.
+- **One side deleted a logic symbol that the other side changed.** If the primary deleted it, it is deleted. If the primary changed it, it stays, with the change.
 - **Both sides put a device in the same slot,** such as two Cresnet devices at the same ID. The primary's device is kept. The other device is removed, along with its symbol and settings.
 
 Each time this happens, a warning names the object, what each file had, and which was kept:
 
     WARNING: Conflict in Sm 21 (One Shot): P1 is '.75s' in your file and '.25s' in their file.  Kept theirs.
 
-Nothing is discarded without a warning. With the default, it is your change that is discarded, so read the warnings and make that change again if it is still wanted.
+Nothing is discarded without a warning.
 
 The primary also keeps its handle numbers where the two sides collide. The other side's new objects are the ones renumbered.
+
+
+## The conflict folder ##
+
+When a logic symbol loses a conflict, the losing version is not thrown away. The whole symbol, as the other file had it, is copied into a subsystem named `Merge Conflicts` at the end of the Logic folder:
+
+    Logic
+      ...
+      Merge Conflicts            (commented out)
+        Lighting                   one folder for each subsystem a copy came from
+          One Shot                 the version that lost
+
+A second warning says so:
+
+    WARNING: Your version of Sm 21 (One Shot) is in the Merge Conflicts folder, commented out.
+
+The folder and everything in it are commented out, so the copies take no part in the program. The merged program compiles and runs with the primary's version. Each copy keeps its signals and parameters, so you can open it in SIMPL Windows beside the version that was kept and settle the difference there. Delete the folder when you are done.
+
+A symbol is copied once, however many of its keys were in conflict. A symbol the primary deleted and the other side changed is copied too.
+
+The folder holds logic symbols, macro calls and SIMPL+ modules. These conflicts are reported by a warning only:
+
+- a subsystem's own name;
+- device symbols and Smart Graphics symbols, which belong to a device or object that cannot be in the program twice;
+- signals, the header, and device, port and Ethernet settings.
+
+With `--no-conflict-folder` no copies are kept, and the warnings are the only record of what was discarded.
 
 
 ## Limits ##
 
 - It cannot stop and ask you to settle a conflict. The primary always wins.
 - The exit status is 0 even when there were conflicts. Check the warnings.
+- A subsystem or a device symbol that one side deleted and the other side changed is kept with the change, whichever file is the primary, and without a warning.
 - If both sides add an identical new symbol, the result has two of them.
 - Signals that nothing is connected to are not written to the merged program.
 - Open symbol windows are not merged.
@@ -92,7 +122,7 @@ The tests need `pytest`. Most of them run the program on two real SIMPL Windows 
 
 ## Current state ##
 
-Not yet proven in real use. The merges are tested against edits made by the test suite to two real programs. No merged program has yet been opened and compiled in SIMPL Windows. Until that has been done on your own programs, keep the three input files and check the result before relying on it.
+Not yet proven in real use. The merges are tested against edits made by the test suite to two real programs. The conflict folder is written the way SIMPL Windows itself writes commented-out symbols. No merged program has yet been opened and compiled in SIMPL Windows. Until that has been done on your own programs, keep the three input files and check the result before relying on it.
 
 
 ## Credits and license ##

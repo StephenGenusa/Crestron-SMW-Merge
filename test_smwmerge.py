@@ -379,7 +379,7 @@ def test_same_key_changed_on_both_sides_takes_theirs_by_default(tmp_path):
 	mine, theirs, base = three_programs(tmp_path,
 		set_key('Sm', '21', 'P1', '.75s'), set_key('Sm', '21', 'P1', '.25s'))
 
-	text, log = merged_text(mine, theirs, base)
+	text, log = merged_text(mine, theirs, base, '--no-conflict-folder')
 
 	expected = Program.load(FUSION)
 	put(expected.one(ObjTp='Sm', H='21'), 'P1', '.25s')
@@ -390,7 +390,7 @@ def test_same_key_changed_on_both_sides_takes_mine_when_mine_is_primary(tmp_path
 	mine, theirs, base = three_programs(tmp_path,
 		set_key('Sm', '21', 'P1', '.75s'), set_key('Sm', '21', 'P1', '.25s'))
 
-	text, log = merged_text(mine, theirs, base, '--primary', 'mine')
+	text, log = merged_text(mine, theirs, base, '--primary', 'mine', '--no-conflict-folder')
 
 	expected = Program.load(FUSION)
 	put(expected.one(ObjTp='Sm', H='21'), 'P1', '.75s')
@@ -664,3 +664,288 @@ def test_handle_range_that_makes_no_sense_is_left_alone(handles):
 	chunk = device_with_handles(handles)
 
 	assert smwmerge.expandDeviceRanges(chunk) == [chunk]
+
+
+########################################################
+##   The conflict folder
+########################################################
+
+FOLDER_NAME = 'Merge Conflicts'
+MINE_SAYS = set_key('Sm', '21', 'P1', '.75s')
+THEIRS_SAYS = set_key('Sm', '21', 'P1', '.25s')
+
+def both(*edits):
+	def edit(program):
+		for each in edits:
+			each(program)
+	return edit
+
+def children(block):
+	return [pair[1] for pair in block if pair[0][0] == 'C' and pair[0][1:].isdigit()]
+
+def key_names(block):
+	return [pair[0] for pair in block]
+
+def merged_program(tmp_path, my_edit, their_edit, *options):
+	mine, theirs, base = three_programs(tmp_path, my_edit, their_edit)
+	text, log = merged_text(mine, theirs, base, *options)
+	return Program(text), log
+
+def conflict_roots(program):
+	return [b for b in program.find(ObjTp='Sm', SmC='156') if dict(b).get('Cmn1') == FOLDER_NAME]
+
+def conflict_folder(program):
+	'''The conflict folder, and its sub-folders as {caption: [copies]}'''
+	roots = conflict_roots(program)
+	assert len(roots) == 1
+	groups = {}
+	for handle in children(roots[0]):
+		group = program.one(ObjTp='Sm', H=handle)
+		groups[get(group, 'Cmn1')] = [program.one(ObjTp='Sm', H=child) for child in children(group)]
+	return roots[0], groups
+
+def without_conflict_folder(program):
+	'''Take the conflict folder and everything in it back out'''
+	root, groups = conflict_folder(program)
+	for handle in children(root):
+		group = program.one(ObjTp='Sm', H=handle)
+		for child in children(group):
+			program.blocks.remove(program.one(ObjTp='Sm', H=child))
+		program.blocks.remove(group)
+	delete_symbol(program, get(root, 'H'))
+	return program
+
+def caption(handle):
+	return get(Program.load(FUSION).one(ObjTp='Sm', H=handle), 'Cmn1')
+
+def assert_consistent(program):
+	'''Handles are unique, and each parent lists exactly the symbols that name it'''
+	symbols = program.find(ObjTp='Sm')
+	handles = [get(b, 'H') for b in symbols]
+	assert len(handles) == len(set(handles))
+	listed = {}
+	for block in symbols:
+		kids = children(block)
+		if 'mC' in dict(block):
+			assert get(block, 'mC') == str(len(kids))
+		for kid in kids:
+			assert kid in handles
+			assert not kid in listed
+			listed[kid] = get(block, 'H')
+			if dict(block).get('OpF') == '0':
+				assert dict(program.one(ObjTp='Sm', H=kid)).get('OpF') == '0'
+	for block in symbols:
+		if 'PrH' in dict(block):
+			assert listed[get(block, 'H')] == get(block, 'PrH')
+
+
+def test_conflict_makes_a_commented_out_folder_at_the_end_of_the_logic(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS)
+
+	root, groups = conflict_folder(result)
+	logic = result.one(ObjTp='Sm', H='4')
+	assert get(root, 'PrH') == '4'
+	assert children(logic)[-1] == get(root, 'H')
+	assert get(logic, 'mC') == '11'
+	# laid out like the subsystems already in the program, and commented out by hand
+	assert key_names(root) == ['ObjTp', 'H', 'SmC', 'Nm', 'ObjVer', 'PrH', 'CF', 'OpF', 'HandF', 'Cmn1', 'mC', 'C1']
+	existing = result.one(ObjTp='Sm', H='20')
+	assert [get(root, key) for key in ('Nm', 'ObjVer', 'CF')] == [get(existing, key) for key in ('Nm', 'ObjVer', 'CF')]
+	assert (get(root, 'OpF'), get(root, 'HandF')) == ('0', '1')
+
+
+def test_conflict_copies_are_grouped_by_the_subsystem_they_came_from(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS)
+
+	root, groups = conflict_folder(result)
+	assert list(groups) == [caption('20')]
+	group = result.one(ObjTp='Sm', H=children(root)[0])
+	assert key_names(group) == ['ObjTp', 'H', 'SmC', 'Nm', 'ObjVer', 'PrH', 'CF', 'OpF', 'PropF', 'Cmn1', 'mC', 'C1']
+	assert (get(group, 'PrH'), get(group, 'OpF'), get(group, 'PropF')) == (get(root, 'H'), '0', '1')
+
+
+def test_conflict_copy_is_the_other_sides_whole_symbol_commented_out(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS)
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	group = result.one(ObjTp='Sm', H=children(root)[0])
+	mine = Program.load(FUSION)
+	MINE_SAYS(mine)
+	expected = [list(pair) for pair in mine.one(ObjTp='Sm', H='21')]
+	put(expected, 'H', get(copy, 'H'))
+	put(expected, 'PrH', get(group, 'H'))
+	position = key_names(expected).index('n1O') + 1
+	expected[position:position] = [['OpF', '0'], ['PropF', '1']]
+	assert copy == expected
+	assert not Program.load(FUSION).find(ObjTp='Sm', H=get(copy, 'H'))
+
+
+def test_conflict_folder_changes_nothing_else(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS)
+
+	expected = Program.load(FUSION)
+	THEIRS_SAYS(expected)
+	assert without_conflict_folder(result).text() == expected.text()
+
+
+def test_conflict_copy_is_theirs_when_mine_is_primary(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS, '--primary', 'mine')
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	assert get(copy, 'P1') == '.25s'
+	assert get(result.one(ObjTp='Sm', H='21'), 'P1') == '.75s'
+	assert 'Their version of Sm 21 (One Shot) is in the Merge Conflicts folder, commented out.' in log
+
+
+def test_conflict_warning_says_where_the_other_version_went(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS)
+
+	assert 'Your version of Sm 21 (One Shot) is in the Merge Conflicts folder, commented out.' in log
+
+
+def test_conflicts_in_two_subsystems_get_a_group_each(tmp_path):
+	result, log = merged_program(tmp_path,
+		both(MINE_SAYS, set_key('Sm', '47', 'P1', 'mine')), both(THEIRS_SAYS, set_key('Sm', '47', 'P1', 'theirs')))
+
+	root, groups = conflict_folder(result)
+	assert list(groups) == [caption('20'), caption('44')]
+	assert [[get(copy, 'P1') for copy in copies] for copies in groups.values()] == [['.75s'], ['mine']]
+	assert_consistent(result)
+
+
+def test_symbol_with_several_conflicts_is_copied_once(tmp_path):
+	result, log = merged_program(tmp_path,
+		both(MINE_SAYS, set_key('Sm', '21', 'Cmn1', 'My comment')), both(THEIRS_SAYS, set_key('Sm', '21', 'Cmn1', 'Their comment')))
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	assert (get(copy, 'P1'), get(copy, 'Cmn1')) == ('.75s', 'My comment')
+	assert log.count('is in the Merge Conflicts folder') == 1
+
+
+def test_signal_used_only_by_a_conflict_copy_is_still_written(tmp_path):
+	def rewire(signal_name):
+		def edit(program):
+			signal = append_block(program, [['ObjTp', 'Sg'], ['H', ''], ['Nm', signal_name]])
+			put(program.one(ObjTp='Sm', H='21'), 'I1', signal)
+		return edit
+
+	result, log = merged_program(tmp_path, rewire('only_mine'), rewire('only_theirs'))
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	assert get(copy, 'I1') == get(result.one(ObjTp='Sg', Nm='only_mine'), 'H')
+	assert get(result.one(ObjTp='Sm', H='21'), 'I1') == get(result.one(ObjTp='Sg', Nm='only_theirs'), 'H')
+
+
+@pytest.mark.parametrize('handle', ['20', '6'], ids=['subsystem', 'device symbol'])
+def test_conflict_in_a_subsystem_or_a_device_symbol_is_not_copied(tmp_path, handle):
+	result, log = merged_program(tmp_path,
+		set_key('Sm', handle, 'Cmn1', 'Mine'), set_key('Sm', handle, 'Cmn1', 'Theirs'))
+
+	assert conflict_roots(result) == []
+	assert 'Conflict in Sm ' + handle in log
+	assert not FOLDER_NAME in log
+
+
+def test_no_conflict_folder_option_only_warns(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, THEIRS_SAYS, '--no-conflict-folder')
+
+	assert conflict_roots(result) == []
+	assert 'Conflict in Sm 21' in log
+	assert not FOLDER_NAME in log
+
+
+def test_merge_without_conflicts_has_no_conflict_folder(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, set_key('Sm', '47', 'P1', 'theirs'))
+
+	assert conflict_roots(result) == []
+	assert log == ''
+
+
+def test_program_with_a_conflict_folder_merges_with_itself_unchanged(tmp_path):
+	mine, theirs, base = three_programs(tmp_path, MINE_SAYS, THEIRS_SAYS)
+	text, log = merged_text(mine, theirs, base)
+	assert conflict_roots(Program(text))
+	merged = Program(text).save(tmp_path / 'merged.smw')
+
+	again, log = merged_text(merged, merged, merged)
+
+	assert again == text
+	assert log == ''
+
+
+def test_symbol_changed_by_me_and_deleted_by_them_goes_to_the_conflict_folder(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, lambda program: delete_symbol(program, '21'))
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	assert get(copy, 'P1') == '.75s'
+	assert (get(copy, 'OpF'), get(copy, 'PropF')) == ('0', '1')
+	assert 'Conflict in Sm 21 (One Shot): changed in your file and deleted in their file.  Kept theirs.' in log
+	assert 'Your version of Sm 21 (One Shot) is in the Merge Conflicts folder, commented out.' in log
+	expected = Program.load(FUSION)
+	delete_symbol(expected, '21')
+	assert without_conflict_folder(result).text() == expected.text()
+
+
+def test_symbol_deleted_by_me_and_changed_by_them_keeps_their_change(tmp_path):
+	result, log = merged_program(tmp_path, lambda program: delete_symbol(program, '21'), THEIRS_SAYS)
+
+	assert conflict_roots(result) == []
+	assert get(result.one(ObjTp='Sm', H='21'), 'P1') == '.25s'
+	assert '21' in children(result.one(ObjTp='Sm', H='20'))
+	assert 'Conflict in Sm 21 (One Shot): deleted in your file and changed in their file.  Kept theirs.' in log
+	assert not FOLDER_NAME in log
+	assert_consistent(result)
+
+
+def test_symbol_deleted_by_me_and_changed_by_them_is_deleted_when_mine_is_primary(tmp_path):
+	result, log = merged_program(tmp_path, lambda program: delete_symbol(program, '21'), THEIRS_SAYS, '--primary', 'mine')
+
+	root, groups = conflict_folder(result)
+	[copy] = groups[caption('20')]
+	assert get(copy, 'P1') == '.25s'
+	assert children(result.one(ObjTp='Sm', H='20')) == ['22']
+	assert 'Conflict in Sm 21 (One Shot): deleted in your file and changed in their file.  Kept yours.' in log
+	assert 'Their version of Sm 21 (One Shot) is in the Merge Conflicts folder, commented out.' in log
+
+
+def test_symbol_changed_by_me_and_deleted_by_them_is_only_deleted_without_the_folder(tmp_path):
+	result, log = merged_program(tmp_path, MINE_SAYS, lambda program: delete_symbol(program, '21'), '--no-conflict-folder')
+
+	expected = Program.load(FUSION)
+	delete_symbol(expected, '21')
+	remove_unused_signals(expected)
+	assert result.text() == expected.text()
+	assert 'Conflict in Sm 21 (One Shot): changed in your file and deleted in their file.  Kept theirs.' in log
+	assert not FOLDER_NAME in log
+
+
+def test_changed_symbol_whose_subsystem_they_deleted_goes_straight_into_the_conflict_folder(tmp_path):
+	def delete_subsystem(program):
+		for handle in ('21', '22', '20'):
+			delete_symbol(program, handle)
+
+	result, log = merged_program(tmp_path, MINE_SAYS, delete_subsystem)
+
+	[root] = conflict_roots(result)
+	[copy] = [result.one(ObjTp='Sm', H=handle) for handle in children(root)]
+	assert (get(copy, 'P1'), get(copy, 'OpF'), get(copy, 'PropF')) == ('.75s', '0', '1')
+	assert result.find(ObjTp='Sm', H='20') == []
+	assert_consistent(result)
+
+
+@standalone
+def test_symbol_merge_sets_aside_the_other_sides_version_of_a_conflicting_symbol(monkeypatch):
+	monkeypatch.delenv('DISPLAY', raising=False)
+	monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+	import smwmerge
+	def symbol(parameter):
+		return CRLF.join(['[', 'ObjTp=Sm', 'H=6', 'SmC=5', 'Nm=Buffer', 'PrH=4', 'P1=' + parameter, ']'])
+
+	result = smwmerge.MergeSymbols([symbol('mine')], [symbol('theirs')], [symbol('base')])
+
+	assert result.conflictCopies == [('A', symbol('mine'))]

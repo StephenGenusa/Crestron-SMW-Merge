@@ -39,6 +39,11 @@ sideNames = {'A': 'your', 'B': 'their'}
 def secondary():
 	return 'A' if primary == 'B' else 'B'
 
+# Where a symbol cannot take both sides' changes, the side that loses is kept
+# as a commented-out copy in a folder of this name.
+conflictFolder = True
+conflictFolderName = 'Merge Conflicts'
+
 LOGGING_LEVELS = {'critical': logging.CRITICAL,
                   'error': logging.ERROR,
                   'warning': logging.WARNING,
@@ -270,7 +275,8 @@ class SMWMerger():
 	def threeWay(self, a, b, x, a_name = 'A', b_name = 'B'):
 		self.keyConflict = False
 		self.baseHandles = self._identities(x)
-		a, b = self._mergeChangedObjects( list(a), list(b), x )
+		a, b = self._settleDeletedObjects( list(a), list(b), x )
+		a, b = self._mergeChangedObjects( a, b, x )
 		had_conflict, m = Merge.threeWay( self, a, b, x, a_name, b_name )
 		return had_conflict or self.keyConflict, m
 	
@@ -290,6 +296,19 @@ class SMWMerger():
 			if identity is not None:
 				found[identity] = index
 		return found
+	
+	#an object one side deleted and the other side changed (stub)
+	def _settleDeletedObjects(self, a, b, x):
+		return a, b
+	
+	#told of each object that had keys both sides changed differently (stub)
+	def _objectConflict(self, original, mine, theirs):
+		pass
+	
+	def _label(self, element):
+		'''The type, handle and name of an object, for a message'''
+		keys = dict( self._objectLines(element) )
+		return ( keys.get(smw.key.type, ''), keys.get(smw.key.ref, ''), keys.get(smw.key.name, keys.get(smw.key.comment1, '')) )
 	
 	def _mergeChangedObjects(self, a, b, x):
 		'''Where both sides changed the same object in different ways, merge it
@@ -324,6 +343,7 @@ class SMWMerger():
 				order.append( item[2:] )
 		
 		out = ['[']
+		conflicts = 0
 		for key in order:
 			if key == smw.key.child:
 				out.extend( self._mergeChildren( mine, theirs ) )
@@ -338,6 +358,7 @@ class SMWMerger():
 			else:
 				source = primary
 				self.keyConflict = True
+				conflicts += 1
 				logging.warning( 'Conflict in %s %s (%s): %s is %r in your file and %r in their file.  Kept %ss.'
 					% ( x.get(smw.key.type, ''), x.get(smw.key.ref, ''), x.get(smw.key.name, x.get(smw.key.comment1, '')),
 						key, a.get(key, ''), b.get(key, ''), sideNames[source] ) )
@@ -350,6 +371,9 @@ class SMWMerger():
 				# the rest of the object is marked as the primary's when it is added
 				line = SMWMerger._preprocessAdd( self, line, source )
 			out.append( line )
+		
+		if conflicts:
+			self._objectConflict( original, mine, theirs )
 		
 		out.append(']')
 		return newline.join(out)
@@ -402,8 +426,58 @@ class MergeMaxKeys( Merge ):
 		raise NotImplementedError('MergeMaxKeys somehow fell to the Conflict Manager.')
 		
 class MergeSymbols( SMWMergeGreedy ):
-	'''Different symbols added in the same place are all kept'''
-	pass
+	'''Different symbols added in the same place are all kept.
+	   The side that loses a conflict in a symbol is set aside whole, as
+	   (side, symbol) in conflictCopies, to go in the conflict folder.'''
+	
+	def threeWay(self, a, b, x, a_name = 'A', b_name = 'B'):
+		self.conflictCopies = []
+		return SMWMergeGreedy.threeWay( self, a, b, x, a_name, b_name )
+	
+	def _canCopy(self, element):
+		'''A symbol that stands by itself.  A subsystem has children, and a device
+		   or Smart Graphics symbol belongs to another object that cannot be copied.'''
+		keys = dict( self._objectLines(element) )
+		if keys.get( smw.key.symType ) in smw.symType.folders or not smw.key.parent in keys:
+			return False
+		return not any( key in keys for key in smw.key.ownedBy + (smw.key.childCount,) )
+	
+	def _setAside(self, side, element):
+		if not ( conflictFolder and self._canCopy(element) ):
+			return
+		self.conflictCopies.append( (side, element) )
+		logging.warning( '%s version of %s %s (%s) is in the %s folder, commented out.'
+			% ( ( sideNames[side].capitalize(), ) + self._label(element) + ( conflictFolderName, ) ) )
+	
+	def _objectConflict(self, original, mine, theirs):
+		self._setAside( secondary(), {'A': mine, 'B': theirs}[ secondary() ] )
+	
+	def _settleDeletedObjects(self, a, b, x):
+		'''A symbol one side deleted and the other side changed.  The primary has
+		   its way: its change stays, or its deletion sets the changed symbol aside.'''
+		sides = {'A': a, 'B': b}
+		found = {'A': self._identities(a), 'B': self._identities(b)}
+		dropped = {'A': [], 'B': []}
+		for identity, index in self._identities(x).items():
+			if ( identity in found['A'] ) == ( identity in found['B'] ):
+				continue
+			changer = 'A' if identity in found['A'] else 'B'
+			deleter = 'B' if changer == 'A' else 'A'
+			element = sides[changer][ found[changer][identity] ]
+			if element == x[index] or not self._canCopy(element):
+				continue
+			
+			self.keyConflict = True
+			did = {changer: 'changed', deleter: 'deleted'}
+			logging.warning( 'Conflict in %s %s (%s): %s in your file and %s in their file.  Kept %ss.'
+				% ( self._label(x[index]) + ( did['A'], did['B'], sideNames[primary] ) ) )
+			if deleter == primary:
+				dropped[changer].append( found[changer][identity] )
+				self._setAside( changer, element )
+		
+		for side in sides:
+			sides[side] = [ element for index, element in enumerate(sides[side]) if not index in dropped[side] ]
+		return sides['A'], sides['B']
 		
 
 class Order:
@@ -483,6 +557,15 @@ class smw:
 		CsCrossRef = 'CsH'
 		address  = 'Ad'
 		flag     = 'DvF'
+		commentedOut = 'OpF'	#0=commented out
+		byHand       = 'HandF'	#commented out itself, under a parent that is not
+		propagated   = 'PropF'	#commented out because its parent is
+		#keys that tie a symbol to an object of another type
+		ownedBy  = ( 'DvH', 'CedH', 'ChdH' )
+		#the comment flags are written after the last of these
+		beforeFlags = ( 'PrH', 'CF', 'n1I', 'n2I', 'n1O' )
+		#what a new subsystem takes from one already in the program
+		folderKeys = ( 'SmC', 'Nm', 'ObjVer', 'SmVr' )
 	
 	crossref = {
 		#'PrH': current table
@@ -497,6 +580,8 @@ class smw:
 	
 	class symType:
 		folder  = '156'
+		folders = ( '156', '157' )	#subsystems and the fixed top-level folders
+		folderName = 'SUBSYSTEM'
 	
 	slotFlag = 'Sl'		#value of the flag key on a slot
 		
@@ -655,6 +740,11 @@ class smwObject:
 			del self._data[key]
 		except:
 			pass
+	
+	def insertKey(self, key, value, position):
+		'''add a new key at the given place in the order of the keys'''
+		self._data[key] = self._key(key, value)
+		self._dataOrder.insert( position, key )
 	
 	def setRef(self, value):
 		'''Set this object's reference.  Does not modify the .refs dict.'''
@@ -935,10 +1025,12 @@ class inFile:
 
 class outFile( inFile ):
 	'''Takes a list of SMW Objects and turns them back into a legal SMW file'''
-	def __init__(self, data):
+	def __init__(self, data, conflictCopies=()):
 		self.objOrder = []
 		self.references = {}
 		self.objList = {}
+		#(side, symbol) for each symbol to go in the conflict folder
+		self.conflictCopies = list(conflictCopies)
 		
 		self.buildRefTables( smw.type.signal, dict(self.reservedSignals) )
 		
@@ -1016,15 +1108,7 @@ class outFile( inFile ):
 		global r, o
 		o = obj
 		r = self.references
-		#An object changed on one side is filed under that side only, so when
-		#the reference's own file does not have it, look in the others.
-		refObj = None
-		for table in [file] + [ f for f in ('', primary, secondary()) if f != file ]:
-			try:
-				refObj = self.references[ list ][ table ][ fileRef ]
-				break
-			except KeyError:
-				continue
+		refObj = self.findReference( list, file, fileRef )
 		if refObj is None:
 			if not warn or fileRef == self.implicitRoot.get(list):
 				return
@@ -1033,6 +1117,17 @@ class outFile( inFile ):
 			
 		#set our ref to that object's H value
 		obj.setKey( key, refObj.H )
+	
+	def findReference( self, list, file, ref ):
+		'''The object that a handle in one of the files stands for, or None.
+		   An object changed on one side is filed under that side only, so when
+		   the reference's own file does not have it, look in the others.'''
+		for table in [file] + [ f for f in ('', primary, secondary()) if f != file ]:
+			try:
+				return self.references[ list ][ table ][ ref ]
+			except KeyError:
+				continue
+		return None
 	
 	def correctAllCrossRefs( self ):
 		'''Steps through all objects and corrects the cross references.
@@ -1132,6 +1227,87 @@ class outFile( inFile ):
 		return H
 		
 		
+	
+	def takeNewRef( self, obj ):
+		'''Give an object the handle after the highest one in use'''
+		final = self.references[obj.type]['final']
+		handle = str( max( [0] + [ int(H) for H in final if H.isdigit() ] ) + 1 )
+		final[handle] = obj
+		obj.setRef( handle )
+	
+	def newFolder( self, like, parent, reason, caption ):
+		'''A commented-out subsystem, laid out like one already in the program'''
+		lines = [ '[', smw.key.type + '=' + smw.type.symbol, smw.key.ref + '=' ]
+		if like:
+			lines.extend( key + '=' + like.getKey(key) for key in like._dataOrder if key in smw.key.folderKeys )
+		else:
+			lines.extend([ smw.key.symType + '=' + smw.symType.folder, smw.key.name + '=' + smw.symType.folderName, 'ObjVer=1' ])
+		lines.append( smw.key.parent + '=' + parent.H )
+		if not like or like.hasKey( smw.key.symComplete ):
+			lines.append( smw.key.symComplete + '=2' )
+		lines.extend([ smw.key.commentedOut + '=0', reason + '=1' ])
+		lines.extend( caption )
+		lines.extend([ smw.key.childCount + '=0', ']' ])
+		
+		folder = self.obj( newline.join(lines) )
+		self.takeNewRef( folder )
+		return folder
+	
+	def commentOut( self, obj ):
+		'''Mark a symbol as commented out because the folder it is in is'''
+		position = 1 + max( obj._dataOrder.index(key) for key in smw.key.beforeFlags if key in obj._dataOrder )
+		if obj.hasKey( smw.key.commentedOut ):
+			position = obj._dataOrder.index( smw.key.commentedOut ) + 1
+		else:
+			obj.insertKey( smw.key.commentedOut, '0', position )
+			position += 1
+		if not obj.hasKey( smw.key.propagated ):
+			obj.insertKey( smw.key.propagated, '1', position )
+	
+	def addConflictFolder( self ):
+		'''Put the symbols that lost a conflict in a commented-out folder at the end
+		   of the logic, grouped by the subsystem each came from.  Nothing in a
+		   commented-out folder takes part in the program.
+		   Depends on corrected cross references.'''
+		if not self.conflictCopies:
+			return
+		
+		symbols = self.objList[ smw.type.symbol ]
+		folders = [ obj for obj in symbols if obj.SmC == smw.symType.folder ]
+		logic = [ obj for obj in folders if not obj.hasKey( smw.key.parent ) ]
+		if not logic:
+			logging.warning( 'The program has no logic folder, so there is no %s folder.' % conflictFolderName )
+			return
+		like = ( [ obj for obj in folders if obj.hasKey( smw.key.parent )
+			and obj.getKey( smw.key.name ) in ( '', smw.symType.folderName ) ] or [None] )[0]
+		
+		root = self.newFolder( like, logic[0], smw.key.byHand, [ smw.key.comment1 + '=' + conflictFolderName ] )
+		groups = []		#[ subsystem it stands for, folder, copies ]
+		loose = []
+		for side, element in self.conflictCopies:
+			copy = self.obj( element )
+			source = self.findReference( smw.type.symbol, side, copy.getKey( smw.key.parent ) )
+			if source is None:
+				#the subsystem it was in has gone
+				group = [ None, root, loose ]
+			else:
+				group = ( [ group for group in groups if group[0] is source ] or [None] )[0]
+			if group is None:
+				caption = [ key + '=' + source.getKey(key) for key in source._dataOrder if re.fullmatch( 'Cmn[0-9]+', key ) ]
+				caption = caption or [ smw.key.comment1 + '=' + source.name ]
+				group = [ source, self.newFolder( like, root, smw.key.propagated, caption ), [] ]
+				groups.append( group )
+			
+			self.takeNewRef( copy )
+			copy.setKey( smw.key.parent, group[1].H )
+			self.commentOut( copy )
+			group[2].append( copy )
+		
+		symbols.append( root )
+		for source, folder, copies in groups:
+			symbols.append( folder )
+			symbols.extend( copies )
+		symbols.extend( loose )
 	
 	def origin( self, obj ):
 		'''Where an object came from: '' when it is unchanged, otherwise the side that added or changed it'''
@@ -1317,6 +1493,7 @@ class outFile( inFile ):
 		
 		self.correctAllCrossRefs()
 		self.resolveSlotConflicts()
+		self.addConflictFolder()
 		self.rebuildChildLists( smw.type.symbol )
 		self.rebuildChildLists( smw.type.device )
 		
@@ -1391,6 +1568,7 @@ def merge():
 	oresult = {}
 	conflict = False
 	objResult = []
+	copies = []
 	mergeHandler = smw.merge['unknown']
 	
 	for objType in masterObjOrder:
@@ -1408,6 +1586,7 @@ def merge():
 				conflict = True
 		
 			result.extend(objResult)
+			copies.extend( getattr( objResult, 'conflictCopies', [] ) )
 		
 	logging.info('conflict = ' + str(conflict))
 	
@@ -1415,7 +1594,7 @@ def merge():
 		baseSignals[ signal.name ] = signal
 	
 	global o
-	o = outFile(result)
+	o = outFile(result, copies)
 	
 	if options.output_file:
 		f = open(options.output_file, 'w', encoding=file_encoding, newline='')
@@ -1441,9 +1620,14 @@ def main():
 	parser.add_option("-p", "--primary", dest="primary", metavar="SIDE", choices=['mine', 'theirs'], default='theirs',
 						help='the file that wins when both change the same thing differently: "mine" or "theirs" (default)')
 	
-	global options, primary
+	parser.add_option("--no-conflict-folder", dest="conflict_folder", action="store_false", default=True,
+						help='do not keep the version of a symbol that lost a conflict.  By default it is put, commented out, in a "'
+							+ conflictFolderName + '" folder at the end of the logic')
+	
+	global options, primary, conflictFolder
 	(options, args) = parser.parse_args()
 	primary = {'mine': 'A', 'theirs': 'B'}[options.primary]
+	conflictFolder = options.conflict_folder
 	
 	logging_level = LOGGING_LEVELS.get(options.log_level, logging.WARNING)
 	logging.basicConfig(level=logging_level, filename=options.log_file,
